@@ -19,7 +19,7 @@
             [schema.core :as s]
             [schema.macros :as sm]
 
-            [compojure.core :refer (routes ANY)]
+            [compojure.core :refer (routes ANY GET POST)]
             [clojure.tools.logging :as log]
             [clojure.string :as str]
             [clojure.core.cache :as cache]
@@ -33,7 +33,7 @@
 
             [cook.mesos]
             [cook.authorization :as auth :refer [owner is-authorized?]]
-            [cook.mesos.util :as util]
+            [cook.mesos.util :as util :refer [maybe-uuid]]
 )
   (:import java.util.UUID))
 
@@ -83,8 +83,8 @@
      ;; length at most 128.
      name :- (s/both s/Str (s/pred #(re-matches #"[\.a-zA-Z0-9_-]{0,128}" %) 'under-128-characters-and-alphanum?))
      priority :- (s/both s/Int (s/pred #(<= 0 % 100) 'between-0-and-100))
-     max-retries :- (s/both s/Int (s/pred pos? 'pos?))
-     max-runtime :- (s/both s/Int (s/pred pos? 'pos?))
+     max_retries :- (s/both s/Int (s/pred pos? 'pos?))
+     max_runtime :- (s/both s/Int (s/pred pos? 'pos?))
      cpus :- PosDouble
      mem :- PosDouble
      ;; Make sure the user name is valid. It must begin with a lower case character, end with
@@ -357,54 +357,60 @@
   "Fetches metadata about the given job ID from Datomic.
    Returns nil if there is no job with that UUID in datomic"
   [db fid job-uuid]
-  (if-let [job (d/entity db [:job/uuid job-uuid])]
-    (let [resources (util/job-ent->resources job)]
-      (map->Job
-       {:command (:job/command job)
-        :uuid (str (:job/uuid job))
-        :user (:job/user job)
-        :name (:job/name job "cookjob")
-        :priority (:job/priority job util/default-job-priority)
-        :cpus (:cpus resources)
-        :mem (:mem resources)
-        :max_retries  (:job/max-retries job) ; Consistent with input
-        :max_runtime (:job/max-runtime job Long/MAX_VALUE) ; Consistent with input
-        :framework_id fid
-        :status (name (:job/state job))
-        :uris (:uris resources)
-        :env (util/job-ent->env job)
-        :labels (util/job-ent->label job)
-        ;;TODO include ports
-        :instances
-        (map (fn [instance]
-               (let [hostname (:instance/hostname instance)
-                     executor-states (get-executor-states fid hostname)
-                     url-path (try
-                                (executor-state->url-path hostname (get executor-states (:instance/executor-id instance)))
-                                (catch Exception e
-                                  nil))
-                     start (:instance/start-time instance)
-                     end (:instance/end-time instance)
-                     reason-code (:instance/reason-code instance)
-                     base {:task_id (:instance/task-id instance)
-                           :hostname hostname
-                           :slave_id (:instance/slave-id instance)
-                           :executor_id (:instance/executor-id instance)
-                           :status (name (:instance/status instance))}
-                     base (if url-path
-                            (assoc base :output_url url-path)
-                            base)
-                     base (if start
-                            (assoc base :start_time (.getTime start))
-                            base)
-                     base (if end
-                            (assoc base :end_time (.getTime end))
-                            base)
-                     base (if reason-code
-                            (assoc base :reason_code reason-code)
-                            base)]
-                 base))
-             (:job/instance job))}))))
+  (let [job-uuid  (if (string? job-uuid)
+                    (try (UUID/fromString job-uuid)
+                         (catch Throwable t
+                           (log/warn "[fetch-job-map] Was passed an invalid UUID:" job-uuid "; aborting.")
+                           nil))
+                    job-uuid)]
+    (if-let [job (d/entity db [:job/uuid job-uuid])]
+      (let [resources (util/job-ent->resources job)]
+        (map->Job
+         {:command (:job/command job)
+          :uuid (str (:job/uuid job))
+          :user (:job/user job)
+          :name (:job/name job "cookjob")
+          :priority (:job/priority job util/default-job-priority)
+          :cpus (:cpus resources)
+          :mem (:mem resources)
+          :max_retries  (:job/max-retries job) ; Consistent with input
+          :max_runtime (:job/max-runtime job Long/MAX_VALUE) ; Consistent with input
+          :framework_id fid
+          :status (name (:job/state job))
+          :uris (:uris resources)
+          :env (util/job-ent->env job)
+          :labels (util/job-ent->label job)
+          ;;TODO include ports
+          :instances
+          (map (fn [instance]
+                 (let [hostname (:instance/hostname instance)
+                       executor-states (get-executor-states fid hostname)
+                       url-path (try
+                                  (executor-state->url-path hostname (get executor-states (:instance/executor-id instance)))
+                                  (catch Exception e
+                                    nil))
+                       start (:instance/start-time instance)
+                       end (:instance/end-time instance)
+                       reason-code (:instance/reason-code instance)
+                       base {:task_id (:instance/task-id instance)
+                             :hostname hostname
+                             :slave_id (:instance/slave-id instance)
+                             :executor_id (:instance/executor-id instance)
+                             :status (name (:instance/status instance))}
+                       base (if url-path
+                              (assoc base :output_url url-path)
+                              base)
+                       base (if start
+                              (assoc base :start_time (.getTime start))
+                              base)
+                       base (if end
+                              (assoc base :end_time (.getTime end))
+                              base)
+                       base (if reason-code
+                              (assoc base :reason_code reason-code)
+                              base)]
+                   base))
+               (:job/instance job))})))))
 
 ;;; On POST; JSON blob that looks like:
 ;;; {"jobs": [{"command": "echo hello world",
@@ -551,6 +557,108 @@
                           cheshire/generate-string)))
       ring.middleware.json/wrap-json-params))
 
+
+
+(defn retries
+  "Returns the number of retries for the given job-id, if the current
+  user is authorized to view it."
+  [conn fid request job-id]
+  (let [user (:authorization/user request)
+        job   (fetch-job-map (db conn)
+                             fid
+                             job-id) 
+        authorized?  (and job
+                          (is-authorized? user :read job))]
+    (log/info "[retries] User" user
+              "asked how many retries there are for job-id" job-id)
+    (if (not authorized?)
+      (do
+        (log/info "[retries] User" user 
+                  (if-not job
+                    "asked about a nonexistent job ID; denying."
+                    (str "is not authorized to view job ID " job-id "; denying") ))
+        {:status  404
+         :headers {"Content-Type" "application/json"}
+         :body    (str "Job ID " job-id " not found.")})
+      {:status  200
+       :headers {"Content-Type" "application/json"}
+       :body    (str (:max_retries job))})))
+
+
+(defn set-retries!
+  "Sets the number of retries for the given job-id to the given retries value,
+  if retries is parseable as a long integer and the current user is
+  authorized to modify that job."
+  [conn fid request job-id retries]
+  (let [user (:authorization/user request)
+        uuid (maybe-uuid job-id)
+        job  (fetch-job-map (db conn)
+                            fid
+                            job-id) 
+        authorized?  (and job
+                          (is-authorized? user :update job))
+        retries (try (Long/parseLong retries)
+                     (catch Throwable t
+                       (log/warn "[set-retries!] User" user
+                                 " submitted an unparseable 'retries' value: " retries
+                                 "Aborting request.")
+                       nil))]
+
+    (log/info "[set-retries!] User" user
+              "asked to set retries to" retries " for job-id" job-id)
+
+    (cond (nil? retries)    {:status  400
+                             :headers {"Content-Type" "application/json"}
+                             :body    (str "Couldn't parse the requested number of retries in your POST. POST value should be a long integer.")}
+
+          (not authorized?)  (do
+                               (log/info "[set-retries] User" user 
+                                         (if-not job
+                                           "asked about a nonexistent job ID; denying."
+                                           (str "is not authorized to view job ID " job-id "; denying") ))
+                               {:status  404
+                                :headers {"Content-Type" "application/json"}
+                                :body    (str "Job ID " job-id " not found.")})
+          
+          :else (try
+
+                  (try
+                    (let [eid (-> (d/entity (d/db conn) [:job/uuid uuid])
+                                  :db/id)]
+                      @(d/transact conn
+                                   [
+                                    [:db/add [:job/uuid uuid]
+                                     :job/max-retries retries]
+
+                                    ;; If the job is in the "completed" state, put it back into
+                                    ;; "waiting":
+                                    [:db.fn/cas [:job/uuid uuid]
+                                     :job/state (d/entid (d/db conn) :job.state/completed) :job.state/waiting]]))
+                    ;; :db.fn/cas throws an exception if the job is not already in the "completed" state.
+                    ;; If that happens, that's fine. We just set "retries" only and continue.
+                    (catch java.util.concurrent.ExecutionException e
+                      (if-not (.startsWith (.getMessage e)
+                                           "java.lang.IllegalStateException: :db.error/cas-failed Compare failed:")
+                        (throw e)
+                        @(d/transact conn
+                                     [[:db/add [:job/uuid uuid]
+                                       :job/max-retries retries]]))))
+                  
+
+
+                  {:status 200
+                   :headers {"Content-Type" "application/json"}
+                   :body (str "OK. Retries for job-id " job-id
+                              " set to " retries ".")}
+                  (catch Throwable t
+                    (log/error "[set-retries!] Error updating retries for job-id" job-id
+                               "to" retries ":" 
+                               t)
+                    {:status 500
+                     :headers {"Content-Type" "application/json"}
+                     :body "Internal server error."})) )))
+
+
 (defn handler
   [conn fid task-constraints mesos-pending-jobs-fn]
   (routes
@@ -559,4 +667,11 @@
     (ANY "/queue" []
          (waiting-jobs mesos-pending-jobs-fn))
     (ANY "/running" []
-         (running-jobs conn))))
+         (running-jobs conn))
+
+    (GET  "/jobs/:job-id/retries" [job-id :as request] (retries conn fid request job-id))
+    (POST "/jobs/:job-id/retries" [job-id :as request] (set-retries! conn fid request job-id
+                                                                     (some-> (:body request)
+                                                                             slurp
+                                                                             util/maybe-json
+                                                                             (get "retries"))))))
