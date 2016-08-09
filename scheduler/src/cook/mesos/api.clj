@@ -32,8 +32,9 @@
             [clj-time.core :as t]
 
             [cook.mesos]
+            [cook.mesos.share :as share]
             [cook.authorization :as auth :refer [owner is-authorized?]]
-            [cook.mesos.util :as util :refer [maybe-uuid]]
+            [cook.mesos.util :as util :refer [maybe-uuid maybe-double mapply]]
 )
   (:import java.util.UUID))
 
@@ -249,12 +250,8 @@
   (let [uuid (if (string? uuid)
                (UUID/fromString uuid)
                uuid)]
-    (some-> (d/q '[:find ?owner
-                   :in $ ?uuid
-                   :where [?e :job/uuid ?uuid ] [?e :job/user ?owner]]
-                 db 
-                 uuid)
-            first first)))
+    (some->  (d/entity db [:job/uuid uuid])
+             (:job/user))))
 
 
 (defn validate-and-munge-job
@@ -421,7 +418,7 @@
 ;;;
 ;;; On GET; use repeated job argument
 (defn job-resource
-  [conn fid task-constraints]
+  [conn fid task-constraints auth-fn]
   (-> (resource
         :available-media-types ["application/json"]
         :allowed-methods [:post :get :delete]
@@ -473,24 +470,34 @@
                                           (let [job (fetch-job-map (db conn)
                                                                    fid
                                                                    uuid)]
-                                            (if (or (nil? job) 
-                                                    (not (is-authorized? user :access job)))
-                                              {:is-allowed false
-                                               :message (str "No job found with UUID " uuid)
-                                               :uuid uuid}
-                                              {:is-allowed true
-                                               :uuid uuid})))
-
+                                            (cond (nil? job) (do
+                                                               (log/info "[job-resource] Couldn't find a job with UUID" uuid)
+                                                               {:is-allowed false
+                                                                :message (str "No job found with UUID " uuid)
+                                                                :uuid uuid})
+                                                  (not (auth-fn
+                                                        user
+                                                        :access
+                                                        job)) (do
+                                                                (log/info "[job-resource] User" user " is not authorized to accesss job UUID" uuid)
+                                                                {:is-allowed false
+                                                                 ;; Message does not tell user that they weren't allowed to access this job, to
+                                                                 ;; avoid leaking information about whether a given UUID exists in the system.
+                                                                 :message (str "No job found with UUID " uuid)
+                                                                 :uuid uuid})
+                                                        :else {:is-allowed true
+                                                               :uuid uuid})))
+                            
                             uuids (map uuid-filter uuids)]
                         ;; Return true if every UUID is in use, or
                         ;; else return false with a list of
                         ;; nonexistant UUIDs.
-                        (if (every? (map :is-allowed uuids))
+                        (if (every? :is-allowed uuids)
                           true
                           (let [message  (->> (map :message uuids)
                                                  (remove nil?)
                                                  (str/join "; " ))]
-                            (log/info "Denying access:" message)
+                            (log/info "[job-resource] Denying access:" message)
                             [false {::error message}])))
                       #{:post}
                       true))
@@ -520,14 +527,14 @@
       ring.middleware.json/wrap-json-params))
 
 (defn waiting-jobs
-  [mesos-pending-jobs-fn]
+  [mesos-pending-jobs-fn auth-fn]
   (-> (resource
         :available-media-types ["application/json"]
         :allowed-methods [:get]
         :allowed? (fn [ctx]
                     (let [user  (get-in ctx [:request :authorization/user])]
                       ;; Only allow superusers:
-                      (if (is-authorized? user :access cook.authorization/system)
+                      (if (auth-fn user :access cook.authorization/system)
                         true
                         (do
                           (log/info "[waiting-jobs] Queried by non-admin" user "; denying access.")
@@ -539,14 +546,14 @@
       ring.middleware.json/wrap-json-params))
 
 (defn running-jobs
-  [conn]
+  [conn auth-fn]
   (-> (resource
         :available-media-types ["application/json"]
         :allowed-methods [:get]
         :allowed? (fn [ctx]
                     (let [user  (get-in ctx [:request :authorization/user])]
                       ;; Only allow superusers:
-                      (if (is-authorized? user :access cook.authorization/system)
+                      (if (auth-fn user :access cook.authorization/system)
                         true
                         (do
                           (log/info "[running-jobs] Queried by non-admin" user "; denying access.")
@@ -562,13 +569,13 @@
 (defn retries
   "Returns the number of retries for the given job-id, if the current
   user is authorized to view it."
-  [conn fid request job-id]
+  [conn auth-fn fid request job-id]
   (let [user (:authorization/user request)
         job   (fetch-job-map (db conn)
                              fid
                              job-id) 
         authorized?  (and job
-                          (is-authorized? user :read job))]
+                          (auth-fn user :read job))]
     (log/info "[retries] User" user
               "asked how many retries there are for job-id" job-id)
     (if (not authorized?)
@@ -589,27 +596,28 @@
   "Sets the number of retries for the given job-id to the given retries value,
   if retries is parseable as a long integer and the current user is
   authorized to modify that job."
-  [conn fid request job-id retries]
+  [conn auth-fn fid request job-id requested-retries]
   (let [user (:authorization/user request)
         uuid (maybe-uuid job-id)
         job  (fetch-job-map (db conn)
                             fid
                             job-id) 
         authorized?  (and job
-                          (is-authorized? user :update job))
-        retries (try (Long/parseLong retries)
-                     (catch Throwable t
-                       (log/warn "[set-retries!] User" user
-                                 " submitted an unparseable 'retries' value: " retries
-                                 "Aborting request.")
-                       nil))]
+                          (auth-fn user :update job))
+        retries      (try (Long/parseLong requested-retries)
+                          (catch Throwable t
+                            (log/warn "[set-retries!] User" user
+                                      " submitted an unparseable 'retries' value: " requested-retries
+                                      "Aborting request.")
+                            nil))]
 
     (log/info "[set-retries!] User" user
               "asked to set retries to" retries " for job-id" job-id)
 
     (cond (nil? retries)    {:status  400
                              :headers {"Content-Type" "application/json"}
-                             :body    (str "Couldn't parse the requested number of retries in your POST. POST value should be a long integer.")}
+                             :body    (str "Couldn't parse the requested number of retries in your POST. "
+                                           "POST value should be a long integer. Got: " requested-retries)}
 
           (not authorized?)  (do
                                (log/info "[set-retries] User" user 
@@ -621,35 +629,12 @@
                                 :body    (str "Job ID " job-id " not found.")})
           
           :else (try
-
-                  (try
-                    (let [eid (-> (d/entity (d/db conn) [:job/uuid uuid])
-                                  :db/id)]
-                      @(d/transact conn
-                                   [
-                                    [:db/add [:job/uuid uuid]
-                                     :job/max-retries retries]
-
-                                    ;; If the job is in the "completed" state, put it back into
-                                    ;; "waiting":
-                                    [:db.fn/cas [:job/uuid uuid]
-                                     :job/state (d/entid (d/db conn) :job.state/completed) :job.state/waiting]]))
-                    ;; :db.fn/cas throws an exception if the job is not already in the "completed" state.
-                    ;; If that happens, that's fine. We just set "retries" only and continue.
-                    (catch java.util.concurrent.ExecutionException e
-                      (if-not (.startsWith (.getMessage e)
-                                           "java.lang.IllegalStateException: :db.error/cas-failed Compare failed:")
-                        (throw e)
-                        @(d/transact conn
-                                     [[:db/add [:job/uuid uuid]
-                                       :job/max-retries retries]]))))
-                  
-
-
+                  (util/retry-job! conn uuid retries)
                   {:status 200
                    :headers {"Content-Type" "application/json"}
                    :body (str "OK. Retries for job-id " job-id
                               " set to " retries ".")}
+
                   (catch Throwable t
                     (log/error "[set-retries!] Error updating retries for job-id" job-id
                                "to" retries ":" 
@@ -659,19 +644,98 @@
                      :body "Internal server error."})) )))
 
 
-(defn handler
-  [conn fid task-constraints mesos-pending-jobs-fn]
-  (routes
-    (ANY "/rawscheduler" []
-         (job-resource conn fid task-constraints))
-    (ANY "/queue" []
-         (waiting-jobs mesos-pending-jobs-fn))
-    (ANY "/running" []
-         (running-jobs conn))
 
-    (GET  "/jobs/:job-id/retries" [job-id :as request] (retries conn fid request job-id))
-    (POST "/jobs/:job-id/retries" [job-id :as request] (set-retries! conn fid request job-id
-                                                                     (some-> (:body request)
-                                                                             slurp
-                                                                             util/maybe-json
-                                                                             (get "retries"))))))
+(defn get-resources
+  "Tells the user what share resource types are available in the system, if
+  the current user is an admin."
+  [conn auth-fn request]
+  (let [user (:authorization/user request)
+        authorized? (auth-fn user :access cook.authorization/system)]
+    (if authorized?
+      {:status 200
+       :headers {"Content-Type" "application/json"}
+       :body (cheshire/encode (util/get-all-resource-types (d/db conn)))
+       }
+      {:status 403
+       :body "Forbidden"
+       })))
+
+
+(defn get-user-shares
+  "Tells the user what resource shares are in place for the given username, if
+  the current user is an admin."
+  [conn auth-fn request username]
+  (let [user (:authorization/user request)
+        authorized? (auth-fn user :access cook.authorization/system)]
+    (if authorized?
+      {:status 200
+       :headers {"Content-Type" "application/json"}
+       :body (cheshire/encode (share/get-share (d/db conn) username))
+       }
+      {:status 403
+       :body "Forbidden"
+       })))
+
+
+(defn set-user-shares!
+  "Sets the share for the given username, if the current user is an admin.
+   Shares is a map. Keys must be valid resource types as returned by (get-resources).
+   Values are doubles."
+  [conn auth-fn request username shares]
+  (let [user           (:authorization/user request)
+        authorized?    (auth-fn user :access cook.authorization/system)
+        resource-types (set (util/get-all-resource-types (d/db conn)))
+        shares          (into {} (for [[k v] shares] [k (maybe-double v)]))]
+
+    (if-not authorized?
+      {:status 403
+       :body "Forbidden"
+       }
+
+
+      (if  (or (not (map? shares))
+               (empty? shares)
+               (not (every? #(contains? resource-types %) (keys shares)))
+               (not (every? #(not (nil? %)) (vals shares))))
+        {:status  400
+         :headers {"Content-Type" "application/json"}
+         :body    (str "Invalid resource map requested. "
+                       "Got a request for: " shares ". "
+                       "Valid keys are: "  resource-types ". Valid values are doubles.")}
+        (do
+          (log/info "[set-user-resources!] Setting resource shares for user" username "to" shares "...")
+          (mapply share/set-share! conn username shares)
+          {:status 200
+           :headers {"Content-Type" "application/json"}
+           :body "OK"
+           })))))
+
+
+
+(defn handler
+  [conn fid task-constraints mesos-pending-jobs-fn auth-config]
+  (let [auth-fn (partial is-authorized? auth-config)]
+    (routes
+     (ANY "/rawscheduler" []
+          (job-resource conn fid task-constraints auth-fn))
+     (ANY "/queue" []
+          (waiting-jobs mesos-pending-jobs-fn auth-fn))
+     (ANY "/running" []
+          (running-jobs conn auth-fn))
+
+     ;; Resource shares:
+     (GET  "/resources/" request (get-resources conn auth-fn request))
+     (GET  "/shares/users/:username" [username :as request] (get-user-shares conn auth-fn request username))
+     (POST "/shares/users/:username" [username :as request] (set-user-shares! conn auth-fn
+                                                                              request username
+                                                                              (some-> (:body request)
+                                                                                      slurp
+                                                                                      util/maybe-json)))
+
+     ;; Retrying jobs:
+     (GET  "/jobs/:job-id/retries" [job-id :as request] (retries conn auth-fn fid request job-id))
+     (POST "/jobs/:job-id/retries" [job-id :as request] (set-retries! conn auth-fn fid request job-id
+                                                                      (some-> (:body request)
+                                                                              slurp
+                                                                              util/maybe-json
+                                                                              (get :retries)))))))
